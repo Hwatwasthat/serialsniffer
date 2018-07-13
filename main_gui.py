@@ -7,6 +7,7 @@ from src import single, setup, file_data
 from serial import Serial, SerialException
 from time import ctime, time, localtime
 import sys
+import random
 
 
 class Communicator(QObject):
@@ -18,13 +19,22 @@ class Communicator(QObject):
         self.continue_run = True  # provide a bool run condition for the class
         self.out_signal[str].connect(main_window.main_widget.update_textbox)  # Need details of variable to be sent
 
-    def do_work(self):
-        i = 0
+    def do_work(self, ser, loop):
+        count = 0
         while self.continue_run:
-            i += 1
-            # noinspection PyCallByClass
-            QThread.sleep(1)
-            self.out_signal[str].emit(str(i))  # and need details here
+            if loop:
+                cmd_in, cmd_out = ser.communication()
+                if cmd_in:
+                    count += 1
+                    self.out_signal[str].emit(f"{count}.Device at {ctime()}:\n{cmd_in}")
+                if cmd_out:
+                    count += 1
+                    self.out_signal[str].emit(f"{count}.Computer at {ctime()}:\n{cmd_out}")
+            else:
+                cmd_in = ser.read_command()
+                if cmd_in:
+                    count += 1
+                    self.out_signal[str].emit(f"{count}.Device at {ctime()}:\n{cmd_in}")
 
         self.finished.emit()  # emit the finished signal when the loop is done
 
@@ -53,14 +63,22 @@ class Autosave(QObject):
         self.continue_run = False
 
 
+class PreferencesWindow(QMainWindow):
+    def __init__(self, parent=None):
+        super(PreferencesWindow, self).__init__(parent)
+        self.setWindowTitle('Preferences')
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         # creating roman widget and setting it as central
         self.main_widget = Window(parent=self)
         self.setCentralWidget(self.main_widget)
+        self.dialog = PreferencesWindow(self)
         self.setup_menu_bar()
         self.setWindowTitle("Serial Monitor")
+
 
     def setup_menu_bar(self):
         # filling up a menu bar
@@ -68,26 +86,17 @@ class MainWindow(QMainWindow):
 
         # adding actions for file menu
         open_action = QAction('Open', self)
-        preferences_action = QAction('Preferences', self)
-        close_action = QAction('Close', self)
-
-        # Setup shortcut for exit
-        close_shortcut = QShortcut(QKeySequence("ctrl+C"), self)
-        close_shortcut.activated.connect(self.close)
 
         # File menu
         file_menu = bar.addMenu('File')
         file_menu.addAction(open_action)
-        file_menu.addAction(preferences_action)
-        file_menu.addAction(close_action)
+        file_menu.addAction('Preferences', self.dialog.show, 'ctrl+o')
+        file_menu.addAction('Close', self.close, 'ctrl+q')
 
         help_action = QAction('Help', self)
 
         help_menu = bar.addMenu("Help")
         help_menu.addAction(help_action)
-
-        # use `connect` method to bind signals to desired behavior
-        close_action.triggered.connect(self.close)
 
 
 # noinspection PyArgumentList,PyArgumentList
@@ -115,9 +124,15 @@ class Window(QWidget):
         self.body_label = QLabel('Body end byte')
         self.body_entry = QLineEdit()
 
+        self.set_serial = QPushButton('Set serial settings')
         self.start_stop_button = QPushButton("Start Communication")
         self.save_button = QPushButton("Save commands")
         self.clear_button = QPushButton("Clear")
+
+        self.start_stop_button.setDisabled(True) # Disabled till settings are locked in
+        self.save_button.setDisabled(True)  # Disabled until communication starts
+        self.clear_button.setDisabled(True)  # Also disabled until communication starts)
+
 
         # Creates a scrollable, selectable text field that cannot be edited by the user
         self.output_box = QTextEdit()
@@ -154,9 +169,11 @@ class Window(QWidget):
         h_box_options.addLayout(v_box_combo)
         h_box_options.addLayout(v_box_label_second)
         h_box_options.addLayout(v_box_header_body)
+        h_box_options.addStretch()
 
         # Initialise a Horizontal box for command buttons
         h_box_buttons = QHBoxLayout()
+        h_box_buttons.addWidget(self.set_serial)
         h_box_buttons.addWidget(self.start_stop_button)
         h_box_buttons.addWidget(self.save_button)
         h_box_buttons.addWidget(self.clear_button)
@@ -192,14 +209,22 @@ class Window(QWidget):
         """
         if not self.started:
             self.output_box.clear()  # Clears the textbox so its easier to read
-            self.setup_communication_thread()  # This method handles the messy part of setting up
             self.start_communication_thread()
             self.started = True
             self.start_stop_button.setText("Stop Communication")
+            self.save_button.setDisabled(False)  # Disabled until communication starts
+            self.clear_button.setDisabled(False)
         else:
             self.stop_communication_thread()
             self.started = False
             self.start_stop_button.setText("Start Communication")
+            self.start_stop_button.setDisabled(True)
+            self.save_button.setDisabled(True)
+            self.clear_button.setDisabled(True)
+
+    def setup_serial(self):
+        ser, loop = setup.full_setup((self.combo_first, self.combo_second))
+        self.setup_communication_thread(ser, loop)
 
     def setup_communication_thread(self):
         # Create the instances of thread and worker
@@ -207,6 +232,7 @@ class Window(QWidget):
         self.worker_communication = Communicator()
         self.stop_signal.connect(self.worker_communication.stop)
         self.setup_thread(self.worker_communication, self.thread_communication)
+        self.thread_communication.started.connect(ser, loop)
 
     def setup_autosave_thread(self):
         """
@@ -224,11 +250,9 @@ class Window(QWidget):
     def setup_thread(worker, thread):
         # Connect the stop_signal signal to the stop method of worker
         worker.moveToThread(thread)
-
         worker.finished.connect(thread.quit)  # connect the workers finished signal to stop thread
         worker.finished.connect(worker.deleteLater)  # connect the workers finished signal to clean up worker
         thread.finished.connect(thread.deleteLater)  # connect threads finished signal to clean up thread
-
         # Make it so when the thread receives the start command the worker starts
         thread.started.connect(worker.do_work)
         thread.finished.connect(worker.stop)
